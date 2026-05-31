@@ -1,0 +1,22 @@
+# Build output and compiler files
+bin/
+*.obj
+*.pdb
+*.ilk
+*.exe
+
+# IDE files
+.vs/
+.vscode/
+
+# Generated test output files (keeping only original test files)
+test_images/encrypted*
+test_images/restored*
+test_images/wrong*
+test_images/enc_*
+test_images/final_*
+test_images/fpng_*
+test_images/v2_*
+test_images/*_noisy*
+test_images/*_synth*
+test_images/test_4k_photo.png
