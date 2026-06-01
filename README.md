@@ -5,19 +5,9 @@
 [![SIMD](https://img.shields.io/badge/SIMD-SSE4.1-red.svg)](#)
 [![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)](#)
 
-A high-performance command-line (CLI) and graphical (GUI) utility written in **Pure C/C++** that encrypts and decrypts images using key-based block-shuffling (pixel pixel-block permutation). It uses hardware acceleration (SIMD SSE4.1 via `fpng`, multi-core processing via OpenMP, and CPU cache prefetching) to handle ultra-high-resolution images (up to 4K and above) in milliseconds.
+A command-line (CLI) and graphical (GUI) utility written in **Pure C/C++** that encrypts and decrypts images using key-based block-shuffling (pixel pixel-block permutation).
 
-โปรแกรมสำหรับเข้ารหัส/ถอดรหัสรูปภาพด้วยการสับบล็อกพิกเซลแบบสุ่มตามรหัสผ่าน (Seed) พัฒนาด้วยภาษา **C/C++** แท้ มุ่งเน้นประสิทธิภาพการทำงานระดับสูงสุดผ่านการคำนวณแบบขนาน (OpenMP), SIMD (SSE4.1 fpng), และเทคนิค CPU Cache Prefetching ทำให้สามารถจัดการรูปภาพความละเอียดสูงระดับ 4K ได้ในเวลาเพียงเสี้ยววินาที
-
----
-
-## ⚡ Performance & Optimization Highlights
-This project has been heavily optimized compared to standard image manipulation tools:
-1. **OpenMP Multi-threading**: The pixel block shuffling algorithm is executed in parallel across all available CPU cores using a `guided` schedule for optimal thread load balancing.
-2. **fpng SSE4.1 SIMD**: Custom integrated `fpng` SIMD encoder/decoder allows PNG save operations to run **3-5× faster** and PNG load operations to run **10-12× faster** than standard public-domain `stb_image` libraries.
-3. **CPU Cache Prefetching**: Shuffling uses `_mm_prefetch` instructions to pre-load next blocks into the L1 CPU cache while copying the current block, hiding RAM access latency.
-4. **Optimized I/O**: Custom single-write buffer optimization replaces the slow byte-by-byte file I/O operations of standard libraries.
-5. **Smart Edge Copy**: The engine copies only the remainder edge pixels that do not align with the block size, saving megabytes of redundant memory copies during the shuffling phase.
+โปรแกรมสำหรับเข้ารหัส/ถอดรหัสรูปภาพด้วยการสับบล็อกพิกเซลแบบสุ่มตามรหัสผ่าน (Seed) พัฒนาด้วยภาษา **C/C++** แท้
 
 ---
 
@@ -55,8 +45,8 @@ JigsawProject/
 
 ### Requirements:
 - **Windows OS**
-- **Visual Studio 2019 or newer** (with **Desktop development with C++** workload installed).
-- Make sure **C++ Clang Compiler** or standard **MSVC (v142+)** with **OpenMP** is selected.
+- **Visual Studio** (with **Desktop development with C++** workload installed).
+- Make sure **MSVC** with **OpenMP** support is selected.
 
 ### Steps:
 1. Open Command Prompt (`cmd.exe`).
@@ -109,9 +99,9 @@ If you prefer a visual interface, you can run:
 ```bat
 bin\jigsaw_gui.exe
 ```
-This launches a native, lightweight Windows Win32 API application. It runs the encryption engine on separate background worker threads so that the interface remains completely non-blocking, responsive, and logs real-time CPU thread utilization and processing metrics.
+This launches a native, lightweight Windows Win32 API application. It runs the encryption engine on separate background worker threads so that the interface remains completely non-blocking and responsive.
 
-หากคุณต้องการใช้งานแบบหน้าต่างโปรแกรม ให้รัน `bin\jigsaw_gui.exe` เพื่อเปิดหน้าต่างควบคุมที่พัฒนาด้วยระบบ Win32 API ดั้งเดิม ซึ่งทำงานแบบ Multi-threading ไม่ทำให้ตัวโปรแกรมค้างขณะเข้ารหัสรูปภาพขนาดใหญ่
+หากคุณต้องการใช้งานแบบหน้าต่างโปรแกรม ให้รัน `bin\jigsaw_gui.exe` เพื่อเปิดหน้าต่างควบคุมที่พัฒนาด้วยระบบ Win32 API ดั้งเดิม ซึ่งทำงานแบบ Multi-threading ไม่ทำให้ตัวโปรแกรมค้างขณะเข้ารหัสรูปภาพ
 
 ---
 

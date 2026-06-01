@@ -1,16 +1,8 @@
 /*
  * ============================================================
- *  Jigsaw Image Encrypter  v2.0  (Optimized)
+ *  Jigsaw Image Encrypter
  *  Pure C  |  stb_image  |  OpenMP
  * ============================================================
- *
- *  Optimizations vs v1.0:
- *    [1] PNG compression level 8→1  : Save PNG 3-5x faster
- *    [2] Remove wasted full memcpy  : Skip copying 24MB before shuffle
- *        Only copy edge pixels that won't be covered by blocks
- *    [3] CPU prefetch in shuffle    : Hint CPU to load next block into
- *        cache while copying current block (hide memory latency)
- *    [4] schedule(guided) for OMP  : Better load balancing vs static
  *
  *  Usage:
  *    jigsaw encrypt <input> <output> <seed> [block_size]
@@ -550,7 +542,7 @@ int process_image(const char *input_path, const char *output_path,
             sprintf_s(dec_label, sizeof(dec_label), "stb_image");
         }
 
-        printf("\n--- Performance Breakdown (v2.2 Optimized) ---\n");
+        printf("\n--- Performance Breakdown ---\n");
         printf("1. Load & Decode  (Disk->RAM)  : %8.2f ms  [%s]\n", stats.load_ms, dec_label);
         printf("2. Shuffle        (RAM->RAM)   : %8.2f ms  [OpenMP %d threads + prefetch]\n",
                stats.shuffle_ms, omp_get_max_threads());
@@ -634,8 +626,8 @@ static void print_usage(const char *prog)
     printf("  %s decrypt <input> <output> <seed> [block_size] [png_level]\n\n", prog);
     printf("Arguments:\n");
     printf("  mode       : encrypt | decrypt\n");
-    printf("  input      : image file (jpg, png, bmp)\n");
-    printf("  output     : output file\n");
+    printf("  input      : image file (jpg, png, bmp) or directory for batch mode\n");
+    printf("  output     : output file or directory\n");
     printf("  seed       : integer secret key (e.g. 555)\n");
     printf("  block_size : block size in pixels (default: %d)\n", DEFAULT_BLOCK_SIZE);
     printf("  png_level  : PNG compression 0-9 (default: 1=fast, 9=smallest)\n\n");
@@ -643,6 +635,7 @@ static void print_usage(const char *prog)
     printf("  %s encrypt  photo.jpg    encrypted.jpg  555\n", prog);
     printf("  %s decrypt  encrypted.jpg restored.jpg  555\n", prog);
     printf("  %s encrypt  photo.png    locked.png     555  16  1\n", prog);
+    printf("  %s encrypt  input_dir    output_dir     555\n", prog);
 }
 
 #ifndef JIGSAW_GUI_BUILD
@@ -659,7 +652,7 @@ int main(int argc, char *argv[])
     fpng_init_c();
 
     printf("============================================\n");
-    printf("  Jigsaw Image Encrypter  v3.0 (Batch Mode)\n");
+    printf("  Jigsaw Image Encrypter (Batch Mode)\n");
     printf("  OpenMP | CPU Prefetch | fpng SIMD PNG\n");
     printf("============================================\n\n");
 

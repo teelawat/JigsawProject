@@ -1,6 +1,6 @@
 /*
  * ============================================================
- *  Jigsaw Image Encrypter — Win32 GUI Interface (v4.0)
+ *  Jigsaw Image Encrypter — Win32 GUI Interface
  *  Pure C  |  Win32 API  |  Segoe UI  |  Non-blocking Threads
  * ============================================================
  */
@@ -308,7 +308,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
             // Print initial details to output log
             gui_printf("============================================================\n");
-            gui_printf("  Jigsaw Image Encrypter GUI v4.0\n");
+            gui_printf("  Jigsaw Image Encrypter GUI\n");
             gui_printf("  SSE4.1 fpng SIMD + OpenMP Multi-threading Ready\n");
             gui_printf("============================================================\n\n");
             gui_printf("PNG Codec: fpng/SSE4.1=%s\n", fpng_sse41_supported() ? "YES" : "NO");
@@ -475,7 +475,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     HWND hwnd = CreateWindowExA(
         0,
         szClassName,
-        "Jigsaw Image Encrypter - GUI Control Panel v4.0",
+        "Jigsaw Image Encrypter - GUI Control Panel",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT,
         rect.right - rect.left, rect.bottom - rect.top,
