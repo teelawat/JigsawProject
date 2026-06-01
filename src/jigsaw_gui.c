@@ -28,24 +28,7 @@ name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
 processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 /* ── Declarations of variables and structures from jigsaw.c ── */
-typedef struct {
-    int w, h, c;
-    int status;
-    double total_ms;
-    double load_ms;
-    double shuffle_ms;
-    double save_ms;
-    int used_fpng_decoder;
-} ImageStats;
-
-extern int g_png_compression;
-extern void fpng_init_c(void);
-extern int  fpng_sse41_supported(void);
-extern int  is_directory(const char *path);
-extern int  process_image(const char *input_path, const char *output_path,
-                          unsigned int seed, int block_size, int decrypt);
-extern int  process_directory(const char *input_dir, const char *output_dir,
-                             unsigned int seed, int block_size, int decrypt);
+#include "jigsaw.h"
 
 /* ── Control IDs ── */
 #define ID_RADIO_ENCRYPT  1001
@@ -61,6 +44,7 @@ extern int  process_directory(const char *input_dir, const char *output_dir,
 #define ID_BTN_RUN        1011
 #define ID_EDIT_LOG       1012
 #define ID_TIMER_CHECK    1013
+#define WM_APPEND_LOG     (WM_APP + 1)  /* custom message: thread-safe log append */
 
 /* ── GUI Controls Handles ── */
 HWND hRadioEncrypt, hRadioDecrypt;
@@ -70,10 +54,11 @@ HWND hEditSeed, hEditBlock, hEditPngLv;
 HWND hBtnRun, hEditLog;
 
 HFONT hSegoeFont = NULL;
+HWND  g_hWnd     = NULL;   /* main window handle — สำหรับ PostMessage จาก worker thread */
 
 /* ── Thread global variables ── */
 HANDLE hWorkerThread = NULL;
-BOOL bRunning = FALSE;
+volatile LONG bRunning = 0;
 
 /* Struct to pass parameters to the worker thread */
 typedef struct {
@@ -87,13 +72,29 @@ typedef struct {
 
 WorkerParams threadParams;
 
-/* Append text to Log Edit box */
-void AppendLogText(const char *text)
+/* Append text ตรงๆ — ต้องเรียกจาก UI thread เท่านั้น */
+static void append_log_text_direct(const char *text)
 {
     int len = GetWindowTextLength(hEditLog);
     SendMessage(hEditLog, EM_SETSEL, (WPARAM)len, (LPARAM)len);
     SendMessage(hEditLog, EM_REPLACESEL, 0, (LPARAM)text);
     SendMessage(hEditLog, EM_SCROLL, SB_PAGEDOWN, 0);
+}
+
+/* Fix: Thread-safe append log
+ * - ถ้าเรียกจาก UI thread → direct SendMessage (เร็ว)
+ * - ถ้าเรียกจาก worker thread → PostMessage พร้อม heap-copy
+ *   WM_APPEND_LOG handler จะ free ให้หลัง append */
+void append_log_text(const char *text)
+{
+    if (!g_hWnd) return;
+    DWORD ui_tid = GetWindowThreadProcessId(g_hWnd, NULL);
+    if (GetCurrentThreadId() == ui_tid) {
+        append_log_text_direct(text);
+    } else {
+        char *copy = _strdup(text);
+        if (copy) PostMessage(g_hWnd, WM_APPEND_LOG, 0, (LPARAM)copy);
+    }
 }
 
 /* Direct GUI Printf implementation */
@@ -106,18 +107,17 @@ void gui_printf(const char *format, ...)
     va_end(args);
 
     // Replace \n with \r\n for Win32 Edit control
-    char formatted[4096];
+    char formatted[4096 * 2]; // worst-case: every char is \n
+    size_t max_out = sizeof(formatted) - 2;
     const char *s = buffer;
     char *d = formatted;
-    while (*s && (d - formatted < sizeof(formatted) - 2)) {
-        if (*s == '\n') {
-            *d++ = '\r';
-        }
+    while (*s && ((size_t)(d - formatted) < max_out)) {
+        if (*s == '\n') *d++ = '\r';
         *d++ = *s++;
     }
     *d = '\0';
 
-    AppendLogText(formatted);
+    append_log_text(formatted);
 }
 
 /* Direct GUI Fprintf implementation */
@@ -130,29 +130,23 @@ void gui_fprintf(FILE *stream, const char *format, ...)
     va_end(args);
 
     // Replace \n with \r\n for Win32 Edit control
-    char formatted[4096];
+    char formatted[2048 * 2 + 1]; // worst-case: every char is \n, plus null terminator
+    size_t max_out = sizeof(formatted) - 2;
     const char *s = buffer;
     char *d = formatted;
-    while (*s && (d - formatted < sizeof(formatted) - 2)) {
-        if (*s == '\n') {
-            *d++ = '\r';
-        }
+    while (*s && ((size_t)(d - formatted) < max_out)) {
+        if (*s == '\n') *d++ = '\r';
         *d++ = *s++;
     }
     *d = '\0';
 
-    AppendLogText(formatted);
+    append_log_text(formatted);
 }
 
 /* Worker Thread for image processing */
 unsigned __stdcall ProcessingWorker(void *pParams)
 {
     WorkerParams *params = (WorkerParams *)pParams;
-    
-    // Set PNG level
-    extern int stbi_write_png_compression_level;
-    g_png_compression = params->png_level;
-    stbi_write_png_compression_level = params->png_level;
 
     gui_printf("============================================\n");
     gui_printf("  Jigsaw Engine: Processing started...\n");
@@ -160,9 +154,9 @@ unsigned __stdcall ProcessingWorker(void *pParams)
 
     int res = 0;
     if (is_directory(params->input_path)) {
-        res = process_directory(params->input_path, params->output_path, params->seed, params->block_size, params->decrypt);
+        res = process_directory(params->input_path, params->output_path, params->seed, params->block_size, params->decrypt, params->png_level);
     } else {
-        res = process_image(params->input_path, params->output_path, params->seed, params->block_size, params->decrypt);
+        res = process_image(params->input_path, params->output_path, params->seed, params->block_size, params->decrypt, params->png_level);
     }
 
     if (res == 0) {
@@ -171,12 +165,12 @@ unsigned __stdcall ProcessingWorker(void *pParams)
         gui_printf("\n>>> [ERROR] Processing failed! <<<\n");
     }
 
-    bRunning = FALSE;
+    InterlockedExchange(&bRunning, 0);
     return 0;
 }
 
 /* Browse File Dialog */
-void BrowseFile(HWND hwndParent, HWND hwndEdit, BOOL bSave)
+void browse_file(HWND hwndParent, HWND hwndEdit, BOOL bSave)
 {
     OPENFILENAMEA ofn = {0};
     char szFile[MAX_PATH] = {0};
@@ -204,7 +198,7 @@ void BrowseFile(HWND hwndParent, HWND hwndEdit, BOOL bSave)
 }
 
 /* Browse Folder Dialog */
-void BrowseFolder(HWND hwndParent, HWND hwndEdit)
+void browse_folder(HWND hwndParent, HWND hwndEdit)
 {
     BROWSEINFOA bi = {0};
     bi.hwndOwner = hwndParent;
@@ -222,7 +216,7 @@ void BrowseFolder(HWND hwndParent, HWND hwndEdit)
 }
 
 /* Set standard font recursively for all child controls */
-BOOL CALLBACK SetFontProc(HWND hwnd, LPARAM lParam)
+BOOL CALLBACK set_font_proc(HWND hwnd, LPARAM lParam)
 {
     SendMessage(hwnd, WM_SETFONT, (WPARAM)lParam, TRUE);
     return TRUE;
@@ -300,7 +294,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                                        25, 355, 575, 155, hwnd, (HMENU)ID_EDIT_LOG, NULL, NULL);
 
             // Apply fonts
-            EnumChildWindows(hwnd, SetFontProc, (LPARAM)hSegoeFont);
+            EnumChildWindows(hwnd, set_font_proc, (LPARAM)hSegoeFont);
             SendMessage(hGroupMode, WM_SETFONT, (WPARAM)hSegoeFont, TRUE);
             SendMessage(hGroupPaths, WM_SETFONT, (WPARAM)hSegoeFont, TRUE);
             SendMessage(hGroupOpts, WM_SETFONT, (WPARAM)hSegoeFont, TRUE);
@@ -346,11 +340,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             switch (wmId)
             {
                 case ID_BTN_BROWSE_IN_F:
-                    BrowseFile(hwnd, hEditInput, FALSE);
+                    browse_file(hwnd, hEditInput, FALSE);
                     break;
 
                 case ID_BTN_BROWSE_IN_D:
-                    BrowseFolder(hwnd, hEditInput);
+                    browse_folder(hwnd, hEditInput);
                     break;
 
                 case ID_BTN_BROWSE_OUT:
@@ -358,9 +352,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     char in_path[MAX_PATH];
                     GetWindowTextA(hEditInput, in_path, MAX_PATH);
                     if (is_directory(in_path)) {
-                        BrowseFolder(hwnd, hEditOutput);
+                        browse_folder(hwnd, hEditOutput);
                     } else {
-                        BrowseFile(hwnd, hEditOutput, TRUE);
+                        browse_file(hwnd, hEditOutput, TRUE);
                     }
                     break;
                 }
@@ -390,6 +384,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     threadParams.seed = (unsigned int)atol(seed_str);
                     threadParams.block_size = atoi(block_str);
                     threadParams.png_level = atoi(png_str);
+                    /* Fix: clamp ให้อยู่ใน range ที่ valid */
+                    if (threadParams.png_level < 0) threadParams.png_level = 0;
+                    if (threadParams.png_level > 9) threadParams.png_level = 9;
                     threadParams.decrypt = (SendMessage(hRadioDecrypt, BM_GETCHECK, 0, 0) == BST_CHECKED);
                     strcpy_s(threadParams.input_path, MAX_PATH, in_path);
                     strcpy_s(threadParams.output_path, MAX_PATH, out_path);
@@ -415,7 +412,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                     EnableWindow(hEditBlock, FALSE);
                     EnableWindow(hEditPngLv, FALSE);
 
-                    bRunning = TRUE;
+                    InterlockedExchange(&bRunning, 1);
                     hWorkerThread = (HANDLE)_beginthreadex(NULL, 0, ProcessingWorker, &threadParams, 0, NULL);
                     break;
                 }
@@ -423,8 +420,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             break;
         }
 
+        /* Fix: รับ log message จาก worker thread อย่างปลอดภัย */
+        case WM_APPEND_LOG:
+        {
+            char *text = (char *)lParam;
+            if (text) {
+                append_log_text_direct(text);
+                free(text);
+            }
+            return 0;
+        }
+
+        /* Fix: cleanup worker thread ก่อน destroy window */
         case WM_DESTROY:
             KillTimer(hwnd, ID_TIMER_CHECK);
+            if (hWorkerThread) {
+                /* รอให้ thread จบก่อน (timeout 5 วินาที) แล้วค่อย close handle */
+                WaitForSingleObject(hWorkerThread, 5000);
+                CloseHandle(hWorkerThread);
+                hWorkerThread = NULL;
+            }
             if (hSegoeFont) DeleteObject(hSegoeFont);
             PostQuitMessage(0);
             break;
@@ -487,6 +502,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 0;
     }
 
+    g_hWnd = hwnd;   /* Fix: เก็บ handle ก่อน ShowWindow เพื่อให้ append_log_text ใช้ได้ */
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 

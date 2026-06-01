@@ -29,20 +29,8 @@
   #include <windows.h>
 #endif
 
-#ifdef JIGSAW_GUI_BUILD
-  #define printf(...) gui_printf(__VA_ARGS__)
-  #define fprintf(stream, ...) gui_fprintf(stream, __VA_ARGS__)
-  extern void gui_printf(const char *format, ...);
-  extern void gui_fprintf(FILE *stream, const char *format, ...);
-#endif
+#include "jigsaw.h"
 
-/*
- * fpng C wrapper — ประกาศ extern เพื่อให้ jigsaw.c เรียก fpng_c.cpp ได้
- * fpng ใช้ SSE4.1 SIMD → เร็วกว่า stb PNG encoder 2-5×
- * รองรับเฉพาะ 3ch (RGB) และ 4ch (RGBA)
- */
-extern void fpng_init_c(void);
-extern int  fpng_sse41_supported(void);
 extern int  fpng_encode_to_file_c(const char *path, const void *data,
                                    int w, int h, int num_chans);
 extern unsigned char *fpng_decode_from_file_c(const char *path,
@@ -65,10 +53,6 @@ extern unsigned char *fpng_decode_from_file_c(const char *path,
 #define JPEG_QUALITY         95
 #define PREFETCH_AHEAD        4    /* prefetch 4 blocks ahead */
 
-/* [OPT-1] สำหรับเก็บ compression level ที่ user เลือก
- * จะถูก assign ให้ stbi_write_png_compression_level ใน main() */
-int g_png_compression = 1;
-
 /* ────────────────────────────────────────────────────────────
    generate_permutation
    สร้างอาร์เรย์ perm[0..n-1] ที่สับแบบ Fisher-Yates
@@ -76,11 +60,12 @@ int g_png_compression = 1;
 static void generate_permutation(int *perm, int n, unsigned int seed)
 {
     int i, j, tmp;
+    unsigned int state = seed; // local state – thread‑safe
     for (i = 0; i < n; i++) perm[i] = i;
-    srand(seed);
     for (i = n - 1; i > 0; i--) {
-        j       = (int)(rand() % (i + 1));
-        tmp     = perm[i];
+        state = state * 1664525u + 1013904223u; // Numerical Recipes LCG
+        j = (int)((unsigned int)(state >> 1) % (unsigned int)(i + 1));
+        tmp = perm[i];
         perm[i] = perm[j];
         perm[j] = tmp;
     }
@@ -153,9 +138,12 @@ static void growbuf_callback(void *ctx, void *data, int size)
     if (need > g->capacity) {
         size_t newcap = g->capacity ? g->capacity * 2 : (size_t)4 * 1024 * 1024;
         while (newcap < need) newcap *= 2;
-        g->data = (unsigned char *)realloc(g->data, newcap);
+        unsigned char *tmp = (unsigned char *)realloc(g->data, newcap);
+        if (!tmp) { g->data = NULL; g->capacity = 0; return; } // OOM: bail out
+        g->data = tmp;
         g->capacity = newcap;
     }
+    if (!g->data) return; // guard from OOM from previous allocation
     memcpy(g->data + g->size, data, (size_t)size);
     g->size += (size_t)size;
 }
@@ -213,7 +201,7 @@ static int save_image(const char *path, unsigned char *img_data,
         if (err != 0 || !fp) { free(g.data); return 0; }
     }
 #else
-    fp = fopen(path, "wb");
+    fp = fopen(final_path, "wb");
     if (!fp) { free(g.data); return 0; }
 #endif
     ok = (fwrite(g.data, 1, g.size, fp) == g.size);
@@ -291,15 +279,6 @@ static void free_src_image(unsigned char *src, int used_fpng)
 }
 
 /* ── Batch / Directory Mode Types ─────────────────────────── */
-typedef struct {
-    int w, h, c;
-    int status;
-    double total_ms;
-    double load_ms;
-    double shuffle_ms;
-    double save_ms;
-    int used_fpng_decoder;
-} ImageStats;
 
 typedef struct {
     char name[MAX_PATH];
@@ -333,6 +312,7 @@ static int scan_directory(const char *dir_path, FileInfo **out_files)
 
     int capacity = 64;
     FileInfo *files = (FileInfo *)malloc(capacity * sizeof(FileInfo));
+    if (!files) { FindClose(hFind); return 0; }   /* Fix: ตรวจ malloc fail */
     int count = 0;
 
     do {
@@ -343,7 +323,9 @@ static int scan_directory(const char *dir_path, FileInfo **out_files)
                 str_iequal(ext, "jpeg") || str_iequal(ext, "bmp")) {
                 if (count >= capacity) {
                     capacity *= 2;
-                    files = (FileInfo *)realloc(files, capacity * sizeof(FileInfo));
+                    FileInfo *tmp = (FileInfo *)realloc(files, capacity * sizeof(FileInfo));
+                    if (!tmp) { free(files); FindClose(hFind); return 0; }
+                    files = tmp;
                 }
                 strcpy_s(files[count].name, sizeof(files[count].name), file_name);
                 count++;
@@ -356,29 +338,40 @@ static int scan_directory(const char *dir_path, FileInfo **out_files)
     return count;
 }
 
+static unsigned char *load_image(
+    const char *path, int *w, int *h, int *c, int *used_fpng)
+{
+    *used_fpng = 0;
+    const char *ext = get_extension(path);
+    if (str_iequal(ext, "png")) {
+        int not_fpng = 0;
+        unsigned char *px = fpng_decode_from_file_c(path, w, h, c, &not_fpng);
+        if (px) { *used_fpng = 1; return px; }
+        if (!not_fpng) return NULL; // Corrupted PNG file
+    }
+    return stbi_load(path, w, h, c, 0);
+}
+
 /* ────────────────────────────────────────────────────────────
    process_image_internal
    ──────────────────────────────────────────────────────────── */
 int process_image_internal(const char *input_path, const char *output_path,
-                                  unsigned int seed, int block_size, int decrypt,
-                                  ImageStats *stats)
+                           unsigned int seed, int block_size, int decrypt,
+                           int png_level, ImageStats *stats)
 {
-    int w, h, c;
-    unsigned char *src, *dst;
-    int           *perm;
-    size_t         img_bytes;
-    int            blocks_x, blocks_y, total;
-    int            i;
-    clock_t        t_total_start, t_load_start, t_load_end;
-    clock_t        t_shuffle_start, t_shuffle_end;
-    clock_t        t_save_start, t_save_end;
-    int            used_fpng_decoder = 0;
-    char           final_output_path[MAX_PATH];
-
     memset(stats, 0, sizeof(ImageStats));
-    t_total_start = clock();
+    if (block_size < 1) {
+        JLOG_ERR("Error: block_size must be >= 1\n");
+        stats->status = 1;
+        return 1;
+    }
+    clock_t t_total_start = clock();
+    /* NOTE: stbi_write_png_compression_level ถูก set โดย caller
+     * (process_image หรือ process_directory ก่อน parallel block)
+     * ไม่ set ที่นี่เพื่อหลีกเลี่ยง data race ใน OpenMP batch mode */
 
     /* Resolve output path: if output_path is a directory, append input filename */
+    char final_output_path[MAX_PATH];
     strcpy_s(final_output_path, sizeof(final_output_path), output_path);
     if (is_directory(output_path)) {
         const char *filename = strrchr(input_path, '\\');
@@ -398,28 +391,14 @@ int process_image_internal(const char *input_path, const char *output_path,
             sprintf_s(final_output_path, sizeof(final_output_path), "%s\\%s", output_path, filename);
         }
     }
+    strcpy_s(stats->final_output_path, sizeof(stats->final_output_path), final_output_path);
 
     /* ── โหลดภาพ ─────────────────────────────────── */
-    t_load_start = clock();
-    {
-        const char *in_ext = get_extension(input_path);
-        if (str_iequal(in_ext, "png")) {
-            int not_fpng = 0;
-            src = fpng_decode_from_file_c(input_path, &w, &h, &c, &not_fpng);
-            if (src) {
-                used_fpng_decoder = 1;
-            } else {
-                if (not_fpng) {
-                    src = stbi_load(input_path, &w, &h, &c, 0);
-                } else {
-                    src = NULL;
-                }
-            }
-        } else {
-            src = stbi_load(input_path, &w, &h, &c, 0);
-        }
-    }
-    t_load_end = clock();
+    int w = 0, h = 0, c = 0;
+    int used_fpng_decoder = 0;
+    clock_t t_load_start = clock();
+    unsigned char *src = load_image(input_path, &w, &h, &c, &used_fpng_decoder);
+    clock_t t_load_end = clock();
 
     if (!src) {
         stats->status = 1;
@@ -431,14 +410,14 @@ int process_image_internal(const char *input_path, const char *output_path,
     stats->c = c;
     stats->used_fpng_decoder = used_fpng_decoder;
 
-    blocks_x = w / block_size;
-    blocks_y = h / block_size;
-    total    = blocks_x * blocks_y;
+    int blocks_x = w / block_size;
+    int blocks_y = h / block_size;
+    int total    = blocks_x * blocks_y;
 
     if (total < 2) {
-        t_save_start = clock();
+        clock_t t_save_start = clock();
         int ok = save_image(final_output_path, src, w, h, c);
-        t_save_end = clock();
+        clock_t t_save_end = clock();
         free_src_image(src, used_fpng_decoder);
         stats->load_ms = (double)(t_load_end - t_load_start) * 1000.0 / CLOCKS_PER_SEC;
         stats->save_ms = (double)(t_save_end - t_save_start) * 1000.0 / CLOCKS_PER_SEC;
@@ -448,7 +427,7 @@ int process_image_internal(const char *input_path, const char *output_path,
     }
 
     /* ── permutation ─────────────────────────────── */
-    perm = (int *)malloc((size_t)total * sizeof(int));
+    int *perm = (int *)malloc((size_t)total * sizeof(int));
     if (!perm) { 
         free_src_image(src, used_fpng_decoder); 
         stats->status = 1;
@@ -457,8 +436,8 @@ int process_image_internal(const char *input_path, const char *output_path,
     generate_permutation(perm, total, seed);
 
     /* ── output buffer ───────────────────────────── */
-    img_bytes = (size_t)w * h * c;
-    dst = (unsigned char *)malloc(img_bytes);
+    size_t img_bytes = (size_t)w * h * c;
+    unsigned char *dst = (unsigned char *)malloc(img_bytes);
     if (!dst) { 
         free(perm); 
         free_src_image(src, used_fpng_decoder); 
@@ -468,7 +447,8 @@ int process_image_internal(const char *input_path, const char *output_path,
 
     copy_edges_only(dst, src, w, h, c, blocks_x, blocks_y, block_size);
 
-    t_shuffle_start = clock();
+    clock_t t_shuffle_start = clock();
+    int i;
     #pragma omp parallel for schedule(guided)
     for (i = 0; i < total; i++) {
         int src_idx = decrypt ? perm[i] : i;
@@ -482,15 +462,15 @@ int process_image_internal(const char *input_path, const char *output_path,
 
         copy_block(dst, dst_idx, src, src_idx, w, c, blocks_x, block_size);
     }
-    t_shuffle_end = clock();
+    clock_t t_shuffle_end = clock();
 
     free(perm);
     free_src_image(src, used_fpng_decoder);
 
     /* ── Save ────────────────────────────────────── */
-    t_save_start = clock();
+    clock_t t_save_start = clock();
     int save_ok = save_image(final_output_path, dst, w, h, c);
-    t_save_end = clock();
+    clock_t t_save_end = clock();
 
     free(dst);
 
@@ -507,31 +487,35 @@ int process_image_internal(const char *input_path, const char *output_path,
    process_image (Single-image console print wrapper)
    ──────────────────────────────────────────────────────────── */
 int process_image(const char *input_path, const char *output_path,
-                 unsigned int seed, int block_size, int decrypt)
+                  unsigned int seed, int block_size, int decrypt, int png_level)
 {
+    /* Set stb PNG compression level (single-image path — ปลอดภัย ไม่มี race) */
+    extern int stbi_write_png_compression_level;
+    stbi_write_png_compression_level = png_level;
+
     ImageStats stats;
-    int res = process_image_internal(input_path, output_path, seed, block_size, decrypt, &stats);
+    int res = process_image_internal(input_path, output_path, seed, block_size, decrypt, png_level, &stats);
     if (res != 0) {
         return res;
     }
 
-    printf("Image     : %d x %d  (%d ch, %.2f MB)\n",
-           stats.w, stats.h, stats.c, (double)(stats.w * stats.h * stats.c) / (1024.0 * 1024.0));
+    JLOG("Image     : %d x %d  (%d ch, %.2f MB)\n",
+         stats.w, stats.h, stats.c, (double)(stats.w * stats.h * stats.c) / (1024.0 * 1024.0));
 
     int blocks_x = stats.w / block_size;
     int blocks_y = stats.h / block_size;
     int total = blocks_x * blocks_y;
-    printf("Blocks    : %d x %d = %d  (block=%dpx)\n",
-           blocks_x, blocks_y, total, block_size);
+    JLOG("Blocks    : %d x %d = %d  (block=%dpx)\n",
+         blocks_x, blocks_y, total, block_size);
 
     /* ── ตรวจ format เพื่อแสดง label ที่ถูกต้อง ── */
     {
-        const char *ext = get_extension(output_path);
+        const char *ext = get_extension(stats.final_output_path);
         char fmt_label[32];
         if (str_iequal(ext, "jpg") || str_iequal(ext, "jpeg"))
             sprintf_s(fmt_label, sizeof(fmt_label), "JPG (quality %d)", JPEG_QUALITY);
         else if (str_iequal(ext, "png"))
-            sprintf_s(fmt_label, sizeof(fmt_label), "PNG (level %d)", g_png_compression);
+            sprintf_s(fmt_label, sizeof(fmt_label), "PNG (level %d)", png_level);
         else
             sprintf_s(fmt_label, sizeof(fmt_label), "%s", ext);
 
@@ -542,14 +526,14 @@ int process_image(const char *input_path, const char *output_path,
             sprintf_s(dec_label, sizeof(dec_label), "stb_image");
         }
 
-        printf("\n--- Performance Breakdown ---\n");
-        printf("1. Load & Decode  (Disk->RAM)  : %8.2f ms  [%s]\n", stats.load_ms, dec_label);
-        printf("2. Shuffle        (RAM->RAM)   : %8.2f ms  [OpenMP %d threads + prefetch]\n",
-               stats.shuffle_ms, omp_get_max_threads());
-        printf("3. Encode & Save  (RAM->Disk)  : %8.2f ms  [%s]\n", stats.save_ms, fmt_label);
-        printf("----------------------------------------------\n");
-        printf("Total                          : %8.2f ms\n\n", stats.total_ms);
-        printf("Output    : %s\n", output_path);
+        JLOG("\n--- Performance Breakdown ---\n");
+        JLOG("1. Load & Decode  (Disk->RAM)  : %8.2f ms  [%s]\n", stats.load_ms, dec_label);
+        JLOG("2. Shuffle        (RAM->RAM)   : %8.2f ms  [OpenMP %d threads + prefetch]\n",
+             stats.shuffle_ms, omp_get_max_threads());
+        JLOG("3. Encode & Save  (RAM->Disk)  : %8.2f ms  [%s]\n", stats.save_ms, fmt_label);
+        JLOG("----------------------------------------------\n");
+        JLOG("Total                          : %8.2f ms\n\n", stats.total_ms);
+        JLOG("Output    : %s\n", stats.final_output_path);
     }
 
     return 0;
@@ -559,32 +543,39 @@ int process_image(const char *input_path, const char *output_path,
    process_directory (Parallel Batch Mode)
    ──────────────────────────────────────────────────────────── */
 int process_directory(const char *input_dir, const char *output_dir,
-                             unsigned int seed, int block_size, int decrypt)
+                      unsigned int seed, int block_size, int decrypt, int png_level)
 {
     FileInfo *files = NULL;
     int file_count = scan_directory(input_dir, &files);
-    int i;
 
     if (file_count <= 0) {
-        fprintf(stderr, "Error: No valid image files (.png, .jpg, .jpeg, .bmp) found in '%s'\n", input_dir);
+        JLOG_ERR("Error: No valid image files (.png, .jpg, .jpeg, .bmp) found in '%s'\n", input_dir);
         free(files);
         return 1;
     }
 
     if (!create_directory_if_not_exists(output_dir)) {
-        fprintf(stderr, "Error: Cannot create output directory '%s'\n", output_dir);
+        JLOG_ERR("Error: Cannot create output directory '%s'\n", output_dir);
         free(files);
         return 1;
     }
 
-    printf("Batch Mode: Processing %d images in '%s'...\n", file_count, input_dir);
-    printf("Threads   : %d concurrent threads (File-level Parallelism)\n\n", omp_get_max_threads());
+    JLOG("Batch Mode: Processing %d images in '%s'...\n", file_count, input_dir);
+    JLOG("Threads   : %d concurrent threads (File-level Parallelism)\n\n", omp_get_max_threads());
 
-    ImageStats *stats_array = (ImageStats *)malloc(file_count * sizeof(ImageStats));
-    memset(stats_array, 0, file_count * sizeof(ImageStats));
+    ImageStats *stats_array = (ImageStats *)calloc(file_count, sizeof(ImageStats));
+    if (!stats_array) {
+        JLOG_ERR("Error: out of memory for stats_array\n");
+        free(files);
+        return 1;
+    }
+
+    /* Set stb PNG compression level once before parallel block */
+    extern int stbi_write_png_compression_level;
+    stbi_write_png_compression_level = png_level;
 
     clock_t t_batch_start = clock();
-
+    int i;
     #pragma omp parallel for schedule(dynamic)
     for (i = 0; i < file_count; i++) {
         char in_path[MAX_PATH];
@@ -593,23 +584,26 @@ int process_directory(const char *input_dir, const char *output_dir,
         sprintf_s(in_path, sizeof(in_path), "%s\\%s", input_dir, files[i].name);
         sprintf_s(out_path, sizeof(out_path), "%s\\%s", output_dir, files[i].name);
 
-        int res = process_image_internal(in_path, out_path, seed, block_size, decrypt, &stats_array[i]);
+        int res = process_image_internal(in_path, out_path, seed, block_size, decrypt, png_level, &stats_array[i]);
 
-        if (res == 0) {
-            printf("[OK] %-30s | %4dx%-4d (%dch) | %7.2f ms | %s\n",
-                   files[i].name, stats_array[i].w, stats_array[i].h, stats_array[i].c,
-                   stats_array[i].total_ms, stats_array[i].used_fpng_decoder ? "fpng" : "stb");
-        } else {
-            printf("[FAIL] %-28s | Failed\n", files[i].name);
+        #pragma omp critical (print_log)
+        {
+            if (res == 0) {
+                JLOG("[OK] %-30s | %4dx%-4d (%dch) | %7.2f ms | %s\n",
+                     files[i].name, stats_array[i].w, stats_array[i].h, stats_array[i].c,
+                     stats_array[i].total_ms, stats_array[i].used_fpng_decoder ? "fpng" : "stb");
+            } else {
+                JLOG("[FAIL] %-28s | Failed\n", files[i].name);
+            }
         }
     }
 
     double batch_total_ms = (double)(clock() - t_batch_start) * 1000.0 / CLOCKS_PER_SEC;
 
-    printf("\n-------------------------------------------------------------\n");
-    printf("Batch Completed: %d files processed in %.2f ms\n", file_count, batch_total_ms);
-    printf("Average Time   : %.2f ms per image\n", batch_total_ms / file_count);
-    printf("-------------------------------------------------------------\n");
+    JLOG("\n-------------------------------------------------------------\n");
+    JLOG("Batch Completed: %d files processed in %.2f ms\n", file_count, batch_total_ms);
+    JLOG("Average Time   : %.2f ms per image\n", batch_total_ms / file_count);
+    JLOG("-------------------------------------------------------------\n");
 
     free(files);
     free(stats_array);
@@ -664,13 +658,22 @@ int main(int argc, char *argv[])
     mode        = argv[1];
     input_path  = argv[2];
     output_path = argv[3];
-    seed        = (unsigned int)atol(argv[4]);
+    /* Fix: ใช้ strtoul แทน atol เพื่อ detect invalid seed */
+    {
+        char *endptr;
+        unsigned long raw = strtoul(argv[4], &endptr, 10);
+        if (*endptr != '\0') {
+            fprintf(stderr, "Error: invalid seed '%s' — must be a non-negative integer\n", argv[4]);
+            return 1;
+        }
+        seed = (unsigned int)raw;
+    }
     block_size  = (argc >= 6) ? atoi(argv[5]) : DEFAULT_BLOCK_SIZE;
 
     /* [OPT-1] PNG compression level: arg7 or default 1 (fast) */
-    g_png_compression = (argc >= 7) ? atoi(argv[6]) : 1;
-    if (g_png_compression < 0) g_png_compression = 0;
-    if (g_png_compression > 9) g_png_compression = 9;
+    int png_level = (argc >= 7) ? atoi(argv[6]) : 1;
+    if (png_level < 0) png_level = 0;
+    if (png_level > 9) png_level = 9;
 
     if (block_size < 1) {
         fprintf(stderr, "Error: block_size must be >= 1\n");
@@ -686,15 +689,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* [OPT-1] Set stb PNG compression level at runtime */
-    stbi_write_png_compression_level = g_png_compression;
-
     printf("Mode      : %s\n", decrypt ? "DECRYPT" : "ENCRYPT");
     printf("Input     : %s\n", input_path);
     printf("Output    : %s\n", output_path);
     printf("Seed      : %u\n", seed);
     printf("Block Size: %d x %d px\n", block_size, block_size);
-    printf("PNG Level : %d  (0=fastest/big, 9=slowest/small)\n", g_png_compression);
+    printf("PNG Level : %d  (0=fastest/big, 9=slowest/small)\n", png_level);
 
     printf("PNG Codec  : fpng/SSE4.1=%s  stb-fallback=(grayscale/non-fpng)\n",
            fpng_sse41_supported() ? "YES (fast path)" : "NO (scalar)");
@@ -706,9 +706,9 @@ int main(int argc, char *argv[])
     printf("\n");
 
     if (is_directory(input_path)) {
-        return process_directory(input_path, output_path, seed, block_size, decrypt);
+        return process_directory(input_path, output_path, seed, block_size, decrypt, png_level);
     } else {
-        return process_image(input_path, output_path, seed, block_size, decrypt);
+        return process_image(input_path, output_path, seed, block_size, decrypt, png_level);
     }
 }
 #endif
