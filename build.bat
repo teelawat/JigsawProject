@@ -26,8 +26,8 @@ call "%VCVARS%" x64 >nul 2>&1
 if not exist "bin" mkdir "bin"
 
 :: Compiler flags
-set "CFLAGS=/nologo /O2 /W3 /openmp /Iinclude"
-set "CXXFLAGS=/nologo /O2 /W3 /openmp /Iinclude /std:c++17"
+set "CFLAGS=/nologo /O2 /W3 /openmp /arch:AVX2 /Iinclude"
+set "CXXFLAGS=/nologo /O2 /W3 /openmp /arch:AVX2 /Iinclude /std:c++17"
 set "OUT_CLI=bin\jigsaw.exe"
 set "OUT_GUI=bin\jigsaw_gui.exe"
 

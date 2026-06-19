@@ -30,6 +30,8 @@
 #endif
 
 #include "jigsaw.h"
+#include <stdint.h>
+#include <immintrin.h>
 
 extern int  fpng_encode_to_file_c(const char *path, const void *data,
                                    int w, int h, int num_chans);
@@ -41,7 +43,7 @@ extern unsigned char *fpng_decode_from_file_c(const char *path,
 #if defined(_MSC_VER)
   #include <intrin.h>
   /* _mm_prefetch(addr, hint): hint = _MM_HINT_T0 (L1 cache) */
-  #define PREFETCH(addr)  _mm_prefetch((const char*)(addr), _MM_HINT_T0)
+  #define PREFETCH(addr)  _mm_prefetch((const char*)(addr), _MM_HINT_T1)
 #elif defined(__GNUC__)
   #define PREFETCH(addr)  __builtin_prefetch((addr), 0, 1)
 #else
@@ -88,6 +90,38 @@ static inline const unsigned char *block_src_ptr(
    copy_block  (with prefetch hint parameter)
    คัดลอกบล็อก block_size×block_size pixels
    ──────────────────────────────────────────────────────────── */
+static inline void copy_row_generic_simd(unsigned char *d, const unsigned char *s, int len)
+{
+    int i = 0;
+#if defined(__AVX2__)
+    for (; i <= len - 32; i += 32) {
+        _mm256_storeu_si256((__m256i*)(d + i), _mm256_loadu_si256((const __m256i*)(s + i)));
+    }
+#endif
+    for (; i <= len - 16; i += 16) {
+        _mm_storeu_si128((__m128i*)(d + i), _mm_loadu_si128((const __m128i*)(s + i)));
+    }
+    int rem = len - i;
+    if (rem >= 8) {
+        *(uint64_t*)(d + i) = *(const uint64_t*)(s + i);
+        i += 8;
+        rem -= 8;
+    }
+    if (rem >= 4) {
+        *(uint32_t*)(d + i) = *(const uint32_t*)(s + i);
+        i += 4;
+        rem -= 4;
+    }
+    if (rem >= 2) {
+        *(uint16_t*)(d + i) = *(const uint16_t*)(s + i);
+        i += 2;
+        rem -= 2;
+    }
+    if (rem >= 1) {
+        d[i] = s[i];
+    }
+}
+
 static void copy_block(
     unsigned char       *dst,  int dst_idx,
     const unsigned char *src,  int src_idx,
@@ -110,10 +144,124 @@ static void copy_block(
     const unsigned char *s = src + (sy0 * width + sx0) * channels;
     unsigned char       *d = dst + (dy0 * width + dx0) * channels;
 
-    for (row = 0; row < block_size; row++) {
-        memcpy(d, s, row_bytes);
-        s += row_stride;
-        d += row_stride;
+    /* ── Non-Temporal (NT) store eligibility ──────────────────────
+     * NT stores bypass cache (no Read-For-Ownership), writing directly
+     * to RAM via write-combining buffers. Requires 16/32-byte alignment
+     * on both the block start pointer AND row_stride so every subsequent
+     * row remains aligned throughout the block copy loop.
+     * Caller must call _mm_sfence() after all copy_block calls. */
+    int can_nt16 = (((uintptr_t)d & 15) == 0) && ((row_stride & 15) == 0);
+    int can_nt32 = (((uintptr_t)d & 31) == 0) && ((row_stride & 31) == 0);
+
+    if (block_size == 16 && channels == 3) {
+        /* row_bytes = 48 = 32 + 16 */
+        for (row = 0; row < 16; row++) {
+#if defined(__AVX2__)
+            __m256i r0 = _mm256_loadu_si256((const __m256i*)s);
+            __m128i r1 = _mm_loadu_si128((const __m128i*)(s + 32));
+            if (can_nt32) {
+                _mm256_stream_si256((__m256i*)d,        r0);
+                _mm_stream_si128  ((__m128i*)(d + 32),  r1);
+            } else {
+                _mm256_storeu_si256((__m256i*)d,        r0);
+                _mm_storeu_si128   ((__m128i*)(d + 32), r1);
+            }
+#else
+            __m128i r0 = _mm_loadu_si128((const __m128i*)s);
+            __m128i r1 = _mm_loadu_si128((const __m128i*)(s + 16));
+            __m128i r2 = _mm_loadu_si128((const __m128i*)(s + 32));
+            if (can_nt16) {
+                _mm_stream_si128((__m128i*)d,        r0);
+                _mm_stream_si128((__m128i*)(d + 16), r1);
+                _mm_stream_si128((__m128i*)(d + 32), r2);
+            } else {
+                _mm_storeu_si128((__m128i*)d,        r0);
+                _mm_storeu_si128((__m128i*)(d + 16), r1);
+                _mm_storeu_si128((__m128i*)(d + 32), r2);
+            }
+#endif
+            s += row_stride;
+            d += row_stride;
+        }
+    }
+    else if (block_size == 16 && channels == 4) {
+        /* row_bytes = 64 = 32 + 32 */
+        for (row = 0; row < 16; row++) {
+#if defined(__AVX2__)
+            __m256i r0 = _mm256_loadu_si256((const __m256i*)s);
+            __m256i r1 = _mm256_loadu_si256((const __m256i*)(s + 32));
+            if (can_nt32) {
+                _mm256_stream_si256((__m256i*)d,        r0);
+                _mm256_stream_si256((__m256i*)(d + 32), r1);
+            } else {
+                _mm256_storeu_si256((__m256i*)d,        r0);
+                _mm256_storeu_si256((__m256i*)(d + 32), r1);
+            }
+#else
+            __m128i r0 = _mm_loadu_si128((const __m128i*)s);
+            __m128i r1 = _mm_loadu_si128((const __m128i*)(s + 16));
+            __m128i r2 = _mm_loadu_si128((const __m128i*)(s + 32));
+            __m128i r3 = _mm_loadu_si128((const __m128i*)(s + 48));
+            if (can_nt16) {
+                _mm_stream_si128((__m128i*)d,        r0);
+                _mm_stream_si128((__m128i*)(d + 16), r1);
+                _mm_stream_si128((__m128i*)(d + 32), r2);
+                _mm_stream_si128((__m128i*)(d + 48), r3);
+            } else {
+                _mm_storeu_si128((__m128i*)d,        r0);
+                _mm_storeu_si128((__m128i*)(d + 16), r1);
+                _mm_storeu_si128((__m128i*)(d + 32), r2);
+                _mm_storeu_si128((__m128i*)(d + 48), r3);
+            }
+#endif
+            s += row_stride;
+            d += row_stride;
+        }
+    }
+    else if (block_size == 8 && channels == 3) {
+        /* row_bytes = 24 = 16 + 8 (tail 8 bytes: no NT store available) */
+        for (row = 0; row < 8; row++) {
+            __m128i r0   = _mm_loadu_si128((const __m128i*)s);
+            uint64_t r1  = *(const uint64_t*)(s + 16);
+            if (can_nt16)
+                _mm_stream_si128((__m128i*)d, r0);
+            else
+                _mm_storeu_si128((__m128i*)d, r0);
+            *(uint64_t*)(d + 16) = r1;   /* 8-byte tail: write-combining not available */
+            s += row_stride;
+            d += row_stride;
+        }
+    }
+    else if (block_size == 8 && channels == 4) {
+        /* row_bytes = 32 */
+        for (row = 0; row < 8; row++) {
+#if defined(__AVX2__)
+            __m256i r0 = _mm256_loadu_si256((const __m256i*)s);
+            if (can_nt32)
+                _mm256_stream_si256((__m256i*)d, r0);
+            else
+                _mm256_storeu_si256((__m256i*)d, r0);
+#else
+            __m128i r0 = _mm_loadu_si128((const __m128i*)s);
+            __m128i r1 = _mm_loadu_si128((const __m128i*)(s + 16));
+            if (can_nt16) {
+                _mm_stream_si128((__m128i*)d,        r0);
+                _mm_stream_si128((__m128i*)(d + 16), r1);
+            } else {
+                _mm_storeu_si128((__m128i*)d,        r0);
+                _mm_storeu_si128((__m128i*)(d + 16), r1);
+            }
+#endif
+            s += row_stride;
+            d += row_stride;
+        }
+    }
+    else {
+        for (row = 0; row < block_size; row++) {
+            copy_row_generic_simd(d, s, row_bytes);
+            s += row_stride;
+            d += row_stride;
+        }
     }
 }
 
@@ -437,7 +585,8 @@ int process_image_internal(const char *input_path, const char *output_path,
 
     /* ── output buffer ───────────────────────────── */
     size_t img_bytes = (size_t)w * h * c;
-    unsigned char *dst = (unsigned char *)malloc(img_bytes);
+    /* 32-byte aligned: enables AVX2 NT (non-temporal) stream stores safely */
+    unsigned char *dst = (unsigned char *)_aligned_malloc(img_bytes, 32);
     if (!dst) { 
         free(perm); 
         free_src_image(src, used_fpng_decoder); 
@@ -454,6 +603,9 @@ int process_image_internal(const char *input_path, const char *output_path,
         int src_idx = decrypt ? perm[i] : i;
         int dst_idx = decrypt ? i       : perm[i];
 
+        /* Prefetch src block into L2 (T1) ahead of time.
+         * We do NOT prefetch dst because NT stores bypass cache entirely —
+         * prefetching dst would only pollute L2 with data we overwrite. */
         if (i + PREFETCH_AHEAD < total) {
             int pre_src = decrypt ? perm[i + PREFETCH_AHEAD]
                                   : (i + PREFETCH_AHEAD);
@@ -462,6 +614,8 @@ int process_image_internal(const char *input_path, const char *output_path,
 
         copy_block(dst, dst_idx, src, src_idx, w, c, blocks_x, block_size);
     }
+    /* Flush all NT write-combining buffers before any subsequent read of dst */
+    _mm_sfence();
     clock_t t_shuffle_end = clock();
 
     free(perm);
@@ -472,7 +626,7 @@ int process_image_internal(const char *input_path, const char *output_path,
     int save_ok = save_image(final_output_path, dst, w, h, c);
     clock_t t_save_end = clock();
 
-    free(dst);
+    _aligned_free(dst);
 
     stats->load_ms    = (double)(t_load_end    - t_load_start)    * 1000.0 / CLOCKS_PER_SEC;
     stats->shuffle_ms = (double)(t_shuffle_end - t_shuffle_start) * 1000.0 / CLOCKS_PER_SEC;
