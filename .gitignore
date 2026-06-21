@@ -20,3 +20,8 @@ test_images/v2_*
 test_images/*_noisy*
 test_images/*_synth*
 test_images/test_4k_photo.png
+test_images/_*
+test_images/batch_*
+bench_output.txt
+test_images/bench_8k.png
+test_images/*8k*

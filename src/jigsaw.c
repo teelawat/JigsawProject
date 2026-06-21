@@ -265,6 +265,101 @@ static void copy_block(
     }
 }
 
+/* ─── BCPad Layout Helpers ──────────────────────────────────────────────────
+ * Block-Column-Padding eliminates False Sharing between threads:
+ *   Each block-column slot = CACHE_LINE (64) bytes
+ *   RGB  bs=16: 48B/block-row → 64B slot (+33% mem) → zero False Sharing
+ *   RGBA bs=16: 64B/block-row → 64B slot ( +0% mem) → zero False Sharing
+ * NT stores are always eligible (every block base is 64-byte aligned).
+ * ───────────────────────────────────────────────────────────────── */
+#define CACHE_LINE 64
+
+/* Scatter packed image → BCPad layout (called once before parallel shuffle) */
+static void scatter_to_bcpad(
+    unsigned char *bcpad, const unsigned char *packed,
+    int w, int h, int c, int blocks_x, int block_size)
+{
+    size_t bpr      = (size_t)blocks_x * CACHE_LINE;
+    size_t pack_row = (size_t)w * c;
+    int    rb       = block_size * c;  /* block row bytes in packed layout */
+    memset(bcpad, 0, bpr * (size_t)h);
+    for (int py = 0; py < h; py++) {
+        const unsigned char *sp = packed + (size_t)py * pack_row;
+        unsigned char       *dp = bcpad  + (size_t)py * bpr;
+        for (int bx = 0; bx < blocks_x; bx++)
+            memcpy(dp + (size_t)bx * CACHE_LINE,
+                   sp + (size_t)bx * rb, rb);
+    }
+}
+
+/* Gather BCPad layout → packed image (called once after parallel shuffle) */
+static void gather_from_bcpad(
+    unsigned char *packed, const unsigned char *bcpad,
+    int w, int h, int c, int blocks_x, int block_size)
+{
+    size_t bpr      = (size_t)blocks_x * CACHE_LINE;
+    size_t pack_row = (size_t)w * c;
+    int    rb       = block_size * c;
+    for (int py = 0; py < h; py++) {
+        unsigned char       *dp = packed + (size_t)py * pack_row;
+        const unsigned char *sp = bcpad  + (size_t)py * bpr;
+        for (int bx = 0; bx < blocks_x; bx++)
+            memcpy(dp + (size_t)bx * rb,
+                   sp + (size_t)bx * CACHE_LINE, rb);
+    }
+}
+
+/* Copy one block inside BCPad layout.
+ * bpr = blocks_x * CACHE_LINE  (pre-computed by caller) */
+static void copy_block_bcpad(
+    unsigned char       *dst, int dst_idx,
+    const unsigned char *src, int src_idx,
+    int channels, int blocks_x, int block_size, size_t bpr)
+{
+    int dst_bx = dst_idx % blocks_x,  dst_by = dst_idx / blocks_x;
+    int src_bx = src_idx % blocks_x,  src_by = src_idx / blocks_x;
+
+    const unsigned char *s = src + (size_t)src_by * block_size * bpr
+                                 + (size_t)src_bx * CACHE_LINE;
+    unsigned char       *d = dst + (size_t)dst_by * block_size * bpr
+                                 + (size_t)dst_bx * CACHE_LINE;
+
+    int row;
+    /* d is always CACHE_LINE-aligned → NT stores always eligible */
+    if (block_size == 16 && channels == 3) {
+        /* 48 bytes/row: 32 + 16 */
+        for (row = 0; row < 16; row++) {
+#if defined(__AVX2__)
+            __m256i r0 = _mm256_loadu_si256((const __m256i*)s);
+            __m128i r1 = _mm_loadu_si128 ((const __m128i*)(s + 32));
+            _mm256_stream_si256((__m256i*)d,        r0);
+            _mm_stream_si128  ((__m128i*)(d + 32),  r1);
+#else
+            memcpy(d, s, 48);
+#endif
+            s += bpr;  d += bpr;
+        }
+    } else if (block_size == 16 && channels == 4) {
+        /* 64 bytes/row = 2x AVX2 registers, zero overhead */
+        for (row = 0; row < 16; row++) {
+#if defined(__AVX2__)
+            __m256i r0 = _mm256_loadu_si256((const __m256i*)s);
+            __m256i r1 = _mm256_loadu_si256((const __m256i*)(s + 32));
+            _mm256_stream_si256((__m256i*)d,        r0);
+            _mm256_stream_si256((__m256i*)(d + 32), r1);
+#else
+            memcpy(d, s, 64);
+#endif
+            s += bpr;  d += bpr;
+        }
+    } else {
+        int rb = block_size * channels;
+        for (row = 0; row < block_size; row++) {
+            memcpy(d, s, rb);
+            s += bpr;  d += bpr;
+        }
+    }
+}
 
 /* ── forward declarations ─────────────────────────── */
 static const char *get_extension(const char *path);
@@ -594,6 +689,26 @@ int process_image_internal(const char *input_path, const char *output_path,
         return 1; 
     }
 
+    /* ── BCPad buffers ───────────────────────────── */
+    size_t bpr = (size_t)blocks_x * CACHE_LINE;
+    int block_h = blocks_y * block_size;
+    size_t bcbuf = bpr * (size_t)block_h;
+    unsigned char *bcsrc = (unsigned char *)_aligned_malloc(bcbuf, CACHE_LINE);
+    unsigned char *bcdst = (unsigned char *)_aligned_malloc(bcbuf, CACHE_LINE);
+    if (!bcsrc || !bcdst) {
+        if (bcsrc) _aligned_free(bcsrc);
+        if (bcdst) _aligned_free(bcdst);
+        _aligned_free(dst);
+        free(perm);
+        free_src_image(src, used_fpng_decoder);
+        stats->status = 1;
+        return 1;
+    }
+
+    /* 1. Scatter packed image to block-padded layout */
+    scatter_to_bcpad(bcsrc, src, w, block_h, c, blocks_x, block_size);
+
+    /* 2. Copy edges that are not covered by block grid directly to dst */
     copy_edges_only(dst, src, w, h, c, blocks_x, blocks_y, block_size);
 
     clock_t t_shuffle_start = clock();
@@ -603,21 +718,26 @@ int process_image_internal(const char *input_path, const char *output_path,
         int src_idx = decrypt ? perm[i] : i;
         int dst_idx = decrypt ? i       : perm[i];
 
-        /* Prefetch src block into L2 (T1) ahead of time.
-         * We do NOT prefetch dst because NT stores bypass cache entirely —
-         * prefetching dst would only pollute L2 with data we overwrite. */
+        /* Prefetch src block from bcsrc into L2 (T1) ahead of time. */
         if (i + PREFETCH_AHEAD < total) {
             int pre_src = decrypt ? perm[i + PREFETCH_AHEAD]
                                   : (i + PREFETCH_AHEAD);
-            PREFETCH(block_src_ptr(src, pre_src, w, c, blocks_x, block_size));
+            int pbx = pre_src % blocks_x;
+            int pby = pre_src / blocks_x;
+            PREFETCH(bcsrc + (size_t)pby * block_size * bpr + (size_t)pbx * CACHE_LINE);
         }
 
-        copy_block(dst, dst_idx, src, src_idx, w, c, blocks_x, block_size);
+        copy_block_bcpad(bcdst, dst_idx, bcsrc, src_idx, c, blocks_x, block_size, bpr);
     }
     /* Flush all NT write-combining buffers before any subsequent read of dst */
     _mm_sfence();
     clock_t t_shuffle_end = clock();
 
+    /* 3. Gather shuffled block-padded layout back to packed dst */
+    gather_from_bcpad(dst, bcdst, w, block_h, c, blocks_x, block_size);
+
+    _aligned_free(bcsrc);
+    _aligned_free(bcdst);
     free(perm);
     free_src_image(src, used_fpng_decoder);
 
